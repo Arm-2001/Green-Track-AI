@@ -8,6 +8,8 @@ import json
 import sqlite3
 import re
 import os
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import logging
@@ -17,15 +19,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DeepSeekService:
-    """Service for interacting with DeepSeek API via OpenRouter"""
+    """Service for interacting with DeepSeek API via OpenRouter with rate limiting"""
     
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
         self.model = "deepseek/deepseek-r1:free"
+        self.last_request_time = 0
+        self.min_request_interval = 2  # Minimum 2 seconds between requests
+        self.request_lock = threading.Lock()
         
-    def chat_completion(self, messages: List[Dict], temperature: float = 0.7) -> Dict:
-        """Send chat completion request to DeepSeek via OpenRouter"""
+    def chat_completion(self, messages: List[Dict], temperature: float = 0.7, max_retries: int = 3) -> Dict:
+        """Send chat completion request to DeepSeek via OpenRouter with rate limiting and retries"""
+        
+        # Rate limiting
+        with self.request_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            if time_since_last < self.min_request_interval:
+                sleep_time = self.min_request_interval - time_since_last
+                time.sleep(sleep_time)
+            self.last_request_time = time.time()
+        
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -40,169 +55,216 @@ class DeepSeekService:
             "max_tokens": 1000
         }
         
-        try:
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"DeepSeek API error: {e}")
-            return {"error": str(e)}
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 429:
+                    # Rate limited, wait longer
+                    wait_time = (attempt + 1) * 5  # 5, 10, 15 seconds
+                    logger.warning(f"Rate limited, waiting {wait_time} seconds before retry {attempt + 1}")
+                    time.sleep(wait_time)
+                    continue
+                    
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"DeepSeek API error (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return {"error": f"API request failed after {max_retries} attempts: {str(e)}"}
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        return {"error": "Max retries exceeded"}
 
 class DatabaseManager:
-    """Handle SQLite database operations"""
+    """Handle SQLite database operations with proper connection management"""
     
     def __init__(self, db_path: str = "green_track.db"):
         self.db_path = db_path
+        self.db_lock = threading.Lock()
         self.init_database()
+        
+    def get_connection(self):
+        """Get database connection with proper settings"""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")  # Better for concurrent access
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=memory")
+        conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+        return conn
         
     def init_database(self):
         """Initialize database with required tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Users table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Activities table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                category TEXT NOT NULL,
-                subcategory TEXT,
-                description TEXT,
-                quantity REAL,
-                unit TEXT,
-                co2_estimate REAL,
-                confidence TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        
-        # Recommendations table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS recommendations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                recommendation TEXT,
-                impact_score REAL,
-                difficulty INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
+        with self.db_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Activities table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS activities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    category TEXT NOT NULL,
+                    subcategory TEXT,
+                    description TEXT,
+                    quantity REAL,
+                    unit TEXT,
+                    co2_estimate REAL,
+                    confidence TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            
+            # Recommendations table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    recommendation TEXT,
+                    impact_score REAL,
+                    difficulty INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
         
     def add_user(self, username: str, email: str) -> Optional[int]:
         """Add new user and return user_id"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                "INSERT INTO users (username, email) VALUES (?, ?)",
-                (username, email)
-            )
-            user_id = cursor.lastrowid
-            conn.commit()
-            return user_id
-        except sqlite3.IntegrityError:
-            # User already exists, get their ID
-            cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
-            result = cursor.fetchone()
-            return result[0] if result else None
-        finally:
-            conn.close()
+        with self.db_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
             
+            try:
+                cursor.execute(
+                    "INSERT INTO users (username, email) VALUES (?, ?)",
+                    (username, email)
+                )
+                user_id = cursor.lastrowid
+                conn.commit()
+                return user_id
+            except sqlite3.IntegrityError:
+                # User already exists, get their ID
+                cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+                result = cursor.fetchone()
+                return result[0] if result else None
+            except Exception as e:
+                logger.error(f"Database error in add_user: {e}")
+                return None
+            finally:
+                conn.close()
+                
     def get_user_by_username(self, username: str) -> Optional[Dict]:
         """Get user by username"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT id, username, email, created_at FROM users WHERE username = ?", (username,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return {
-                "id": result[0],
-                "username": result[1],
-                "email": result[2],
-                "created_at": result[3]
-            }
-        return None
+        with self.db_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
             
-    def add_activity(self, user_id: int, activity_data: Dict) -> int:
+            try:
+                cursor.execute("SELECT id, username, email, created_at FROM users WHERE username = ?", (username,))
+                result = cursor.fetchone()
+                
+                if result:
+                    return {
+                        "id": result[0],
+                        "username": result[1],
+                        "email": result[2],
+                        "created_at": result[3]
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"Database error in get_user_by_username: {e}")
+                return None
+            finally:
+                conn.close()
+                
+    def add_activity(self, user_id: int, activity_data: Dict) -> Optional[int]:
         """Add activity to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO activities 
-            (user_id, category, subcategory, description, quantity, unit, co2_estimate, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id,
-            activity_data.get('category'),
-            activity_data.get('subcategory'),
-            activity_data.get('description'),
-            activity_data.get('quantity'),
-            activity_data.get('unit'),
-            activity_data.get('co2_estimate'),
-            activity_data.get('confidence')
-        ))
-        
-        activity_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return activity_id
+        with self.db_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                    INSERT INTO activities 
+                    (user_id, category, subcategory, description, quantity, unit, co2_estimate, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    activity_data.get('category'),
+                    activity_data.get('subcategory'),
+                    activity_data.get('description'),
+                    activity_data.get('quantity'),
+                    activity_data.get('unit'),
+                    activity_data.get('co2_estimate'),
+                    activity_data.get('confidence')
+                ))
+                
+                activity_id = cursor.lastrowid
+                conn.commit()
+                return activity_id
+            except Exception as e:
+                logger.error(f"Database error in add_activity: {e}")
+                return None
+            finally:
+                conn.close()
         
     def get_user_activities(self, user_id: int, days: int = 30) -> List[Dict]:
         """Get user activities from last N days"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        query = '''
-            SELECT id, category, subcategory, description, quantity, unit, co2_estimate, confidence, created_at
-            FROM activities 
-            WHERE user_id = ? AND created_at >= datetime('now', '-{} days')
-            ORDER BY created_at DESC
-        '''.format(days)
-        
-        cursor.execute(query, (user_id,))
-        results = cursor.fetchall()
-        conn.close()
-        
-        activities = []
-        for row in results:
-            activities.append({
-                "id": row[0],
-                "category": row[1],
-                "subcategory": row[2],
-                "description": row[3],
-                "quantity": row[4],
-                "unit": row[5],
-                "co2_estimate": row[6],
-                "confidence": row[7],
-                "created_at": row[8]
-            })
-        
-        return activities
+        with self.db_lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            try:
+                query = '''
+                    SELECT id, category, subcategory, description, quantity, unit, co2_estimate, confidence, created_at
+                    FROM activities 
+                    WHERE user_id = ? AND created_at >= datetime('now', '-{} days')
+                    ORDER BY created_at DESC
+                '''.format(days)
+                
+                cursor.execute(query, (user_id,))
+                results = cursor.fetchall()
+                
+                activities = []
+                for row in results:
+                    activities.append({
+                        "id": row[0],
+                        "category": row[1],
+                        "subcategory": row[2],
+                        "description": row[3],
+                        "quantity": row[4],
+                        "unit": row[5],
+                        "co2_estimate": row[6],
+                        "confidence": row[7],
+                        "created_at": row[8]
+                    })
+                
+                return activities
+            except Exception as e:
+                logger.error(f"Database error in get_user_activities: {e}")
+                return []
+            finally:
+                conn.close()
 
 class CarbonFootprintAnalyzer:
     """Main AI engine for carbon footprint analysis"""
@@ -259,6 +321,10 @@ class CarbonFootprintAnalyzer:
             {"role": "user", "content": prompt}
         ])
         
+        # Check if API failed due to rate limiting
+        if "error" in response:
+            return {"error": f"API temporarily unavailable: {response['error']}"}
+        
         try:
             content = response.get('choices', [{}])[0].get('message', {}).get('content', '{}')
             # Extract JSON from response
@@ -297,15 +363,27 @@ class CarbonFootprintAnalyzer:
             {"role": "user", "content": prompt}
         ])
         
+        # Check if API failed
+        if "error" in response:
+            # Use simple fallback calculation
+            fallback_factors = {
+                'transport': 0.2,  # kg CO2 per km
+                'energy': 0.5,     # kg CO2 per kWh  
+                'food': 10,        # kg CO2 per kg
+                'consumption': 2   # kg CO2 per item
+            }
+            factor = fallback_factors.get(category, 1.0)
+            return max(0.1, quantity * factor)
+        
         try:
             content = response.get('choices', [{}])[0].get('message', {}).get('content', '0')
             # Extract number from response
             number_match = re.search(r'(\d+\.?\d*)', content)
             if number_match:
                 return float(number_match.group(1))
-            return 0.0
+            return 1.0  # Default fallback
         except:
-            return 0.0
+            return 1.0
             
     def generate_recommendations(self, user_activities: List[Dict]) -> List[Dict]:
         """Generate personalized recommendations based on user data"""
@@ -460,6 +538,9 @@ def log_activity():
         
         # Save to database
         activity_id = db_manager.add_activity(user['id'], parsed_data)
+        
+        if not activity_id:
+            return jsonify({"error": "Failed to save activity to database"}), 500
         
         return jsonify({
             "success": True,
